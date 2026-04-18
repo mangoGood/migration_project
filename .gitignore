@@ -1,0 +1,52 @@
+# Output directories
+output/
+*/output/
+
+# Maven
+target/
+*/target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Configuration files (may contain sensitive info)
+*/src/main/resources/*.properties
+!*/src/main/resources/log4j.properties
+
+# Generated files
+*.class
+*.jar
+*.war
+*.ear
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
