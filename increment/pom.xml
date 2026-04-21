@@ -40,9 +40,20 @@
             <version>8.0.33</version>
         </dependency>
         <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+            <version>5.0.1</version>
+        </dependency>
+        <dependency>
             <groupId>org.antlr</groupId>
             <artifactId>antlr4-runtime</artifactId>
             <version>4.13.1</version>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.1</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 
@@ -63,6 +74,7 @@
                 <configuration>
                     <listener>true</listener>
                     <visitor>true</visitor>
+                    <outputDirectory>${project.basedir}/src/main/java</outputDirectory>
                 </configuration>
             </plugin>
             <plugin>
@@ -82,6 +94,11 @@
                         </configuration>
                     </execution>
                 </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.3</version>
             </plugin>
         </plugins>
     </build>

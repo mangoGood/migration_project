@@ -10,6 +10,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.Serializable;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -303,6 +304,16 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         return sb.toString();
     }
 
+    private static final TimeZone UTC = TimeZone.getTimeZone("UTC");
+    private static final SimpleDateFormat TIMESTAMP_FMT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+    private static final SimpleDateFormat DATE_FMT = new SimpleDateFormat("yyyy-MM-dd");
+    private static final SimpleDateFormat TIME_FMT = new SimpleDateFormat("HH:mm:ss");
+    static {
+        TIMESTAMP_FMT.setTimeZone(UTC);
+        DATE_FMT.setTimeZone(UTC);
+        TIME_FMT.setTimeZone(UTC);
+    }
+
     private String encodeValue(Serializable value) {
         if (value == null) {
             return "N";
@@ -321,13 +332,21 @@ public class MySQLBinlogCapture extends AbstractCapture<byte[]> {
         } else if (value instanceof java.math.BigDecimal) {
             return "BD:" + ((java.math.BigDecimal) value).toPlainString();
         } else if (value instanceof java.sql.Timestamp) {
-            return "TS:" + escapeSpecialChars(value.toString());
+            synchronized (TIMESTAMP_FMT) {
+                return "TS:" + escapeSpecialChars(TIMESTAMP_FMT.format((java.sql.Timestamp) value));
+            }
         } else if (value instanceof java.sql.Date) {
-            return "DT:" + value.toString();
+            synchronized (DATE_FMT) {
+                return "DT:" + DATE_FMT.format((java.sql.Date) value);
+            }
         } else if (value instanceof java.sql.Time) {
-            return "TM:" + escapeSpecialChars(value.toString());
+            synchronized (TIME_FMT) {
+                return "TM:" + escapeSpecialChars(TIME_FMT.format((java.sql.Time) value));
+            }
         } else if (value instanceof java.util.Date) {
-            return "TS:" + escapeSpecialChars(new java.sql.Timestamp(((java.util.Date) value).getTime()).toString());
+            synchronized (TIMESTAMP_FMT) {
+                return "TS:" + escapeSpecialChars(TIMESTAMP_FMT.format((java.util.Date) value));
+            }
         } else if (value instanceof Boolean) {
             return "BL:" + (((Boolean) value) ? "1" : "0");
         } else if (value instanceof byte[]) {

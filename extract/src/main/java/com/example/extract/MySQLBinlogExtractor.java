@@ -2,11 +2,17 @@ package com.example.extract;
 
 import com.example.common.AbstractExtractor;
 import com.example.thl.THLEvent;
+import com.example.thl.pipeline.Pipeline;
+import com.example.thl.pipeline.PipelineConfig;
+import com.example.thl.pipeline.PipelineContext;
+import com.example.thl.pipeline.PipelineContextImpl;
 import com.github.shyiko.mysql.binlog.event.*;
 
 import java.io.*;
 import java.sql.*;
 import java.sql.Timestamp;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
 import java.util.*;
 import java.math.BigInteger;
 import java.util.Base64;
@@ -33,6 +39,9 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
     private Map<String, List<String>> tableSchemaCache = new HashMap<>();
     private Map<String, List<String>> tableColumnTypeCache = new HashMap<>();
     private Map<String, Map<String, List<String>>> enumSetValuesCache = new HashMap<>();
+    private Map<String, List<String>> primaryKeyCache = new HashMap<>();
+    
+    private Pipeline pipeline;
     
     @Override
     protected void doInitialize() throws Exception {
@@ -54,6 +63,14 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         loadSeqno();
         
         connectToSourceDatabase();
+        
+        PipelineContext pipelineContext = new PipelineContextImpl(props);
+        ((PipelineContextImpl) pipelineContext).setSourceConnection(sourceConnection);
+        pipeline = PipelineConfig.loadFromProperties(props, pipelineContext);
+        if (pipeline != null) {
+            pipeline.prepare();
+            logger.info("Pipeline initialized with {} filters", pipeline.getFilters().size());
+        }
         
         logger.info("MySQL Binlog Extractor initialized - input: {}, output: {}, seqno: {}", inputDir, outputDir, seqno);
         logger.info("Connected to source database: {}:{}", sourceHost, sourcePort);
@@ -194,7 +211,47 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         
         return values;
     }
-    
+
+    private List<String> getTablePrimaryKeys(String database, String table) {
+        String cacheKey = database + "." + table;
+
+        if (primaryKeyCache.containsKey(cacheKey)) {
+            return primaryKeyCache.get(cacheKey);
+        }
+
+        List<String> pkColumns = new ArrayList<>();
+
+        try {
+            String sql = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE " +
+                        "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY' " +
+                        "ORDER BY ORDINAL_POSITION";
+
+            try (PreparedStatement stmt = sourceConnection.prepareStatement(sql)) {
+                stmt.setString(1, database);
+                stmt.setString(2, table);
+
+                try (ResultSet rs = stmt.executeQuery()) {
+                    while (rs.next()) {
+                        pkColumns.add(rs.getString("COLUMN_NAME"));
+                    }
+                }
+            }
+
+            if (pkColumns.isEmpty()) {
+                logger.warn("No primary key found for table: {}.{}", database, table);
+            } else {
+                logger.debug("Found primary key columns for table: {}.{}: {}", database, table, pkColumns);
+            }
+
+            primaryKeyCache.put(cacheKey, pkColumns);
+
+        } catch (SQLException e) {
+            logger.error("Error fetching primary key for {}.{}: {}", database, table, e.getMessage());
+        }
+
+        return pkColumns;
+    }
+
     public void close() {
         saveSeqno();
         if (sourceConnection != null) {
@@ -324,21 +381,24 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             } else if (part.startsWith("row_count=")) {
                 int rowCount = Integer.parseInt(part.substring("row_count=".length()));
                 thlEvent.addMetadata("row_count", rowCount);
-            } else if (part.startsWith("row0=")) {
+            } else if (part.startsWith("row") && isRowPart(part)) {
                 if (rows == null) {
                     rows = new ArrayList<>();
                 }
-                Object[] row = parseRow(part.substring("row0=".length()));
+                int eqIdx = part.indexOf('=');
+                Object[] row = parseRow(part.substring(eqIdx + 1));
                 rows.add(row);
                 thlEvent.addMetadata("rows", rows);
-            } else if (part.startsWith("old_row0=")) {
+            } else if (part.startsWith("old_row") && isRowPart(part.substring(4))) {
                 if (updateRows == null) {
                     updateRows = new ArrayList<>();
                 }
-                Object[] oldRow = parseRow(part.substring("old_row0=".length()));
+                int eqIdx = part.indexOf('=');
+                Object[] oldRow = parseRow(part.substring(eqIdx + 1));
                 thlEvent.addMetadata("old_row", oldRow);
-            } else if (part.startsWith("new_row0=")) {
-                Object[] newRow = parseRow(part.substring("new_row0=".length()));
+            } else if (part.startsWith("new_row") && isRowPart(part.substring(4))) {
+                int eqIdx = part.indexOf('=');
+                Object[] newRow = parseRow(part.substring(eqIdx + 1));
                 thlEvent.addMetadata("new_row", newRow);
                 if (updateRows == null) {
                     updateRows = new ArrayList<>();
@@ -449,6 +509,15 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                     }
                 }
                 
+                if (database != null && table != null) {
+                    List<String> pkCols = getTablePrimaryKeys(database, table);
+                    if (!pkCols.isEmpty()) {
+                        String pkStr = String.join(",", pkCols);
+                        thlEvent.addMetadata("primary_key_columns", pkStr);
+                        logger.debug("Added primary key columns for event {}: {}", eventType, pkStr);
+                    }
+                }
+                
                 logger.debug("Resolved table info for event {}: database={}, table={}", 
                     eventType, database, table);
             } else {
@@ -536,6 +605,16 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
         return row;
     }
 
+    private static final TimeZone UTC = TimeZone.getTimeZone("UTC");
+    private static final SimpleDateFormat TIMESTAMP_PARSE_FMT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+    private static final SimpleDateFormat DATE_PARSE_FMT = new SimpleDateFormat("yyyy-MM-dd");
+    private static final SimpleDateFormat TIME_PARSE_FMT = new SimpleDateFormat("HH:mm:ss");
+    static {
+        TIMESTAMP_PARSE_FMT.setTimeZone(UTC);
+        DATE_PARSE_FMT.setTimeZone(UTC);
+        TIME_PARSE_FMT.setTimeZone(UTC);
+    }
+
     private Object decodeValue(String encoded) {
         if (encoded == null || encoded.isEmpty()) {
             return null;
@@ -570,11 +649,11 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                 case "BD":
                     return new java.math.BigDecimal(value);
                 case "TS":
-                    return java.sql.Timestamp.valueOf(unescapeSpecialChars(value));
+                    return parseTimestamp(unescapeSpecialChars(value));
                 case "DT":
-                    return java.sql.Date.valueOf(unescapeSpecialChars(value));
+                    return parseDate(unescapeSpecialChars(value));
                 case "TM":
-                    return java.sql.Time.valueOf(unescapeSpecialChars(value));
+                    return parseTime(unescapeSpecialChars(value));
                 case "BL":
                     return "1".equals(value);
                 case "B":
@@ -588,6 +667,57 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             logger.warn("Error decoding value type={}, value={}: {}", type, value, e.getMessage());
             return unescapeSpecialChars(value);
         }
+    }
+
+    private java.sql.Timestamp parseTimestamp(String value) {
+        if (value == null || value.isEmpty()) return null;
+        try {
+            synchronized (TIMESTAMP_PARSE_FMT) {
+                java.util.Date date = TIMESTAMP_PARSE_FMT.parse(value);
+                return new java.sql.Timestamp(date.getTime());
+            }
+        } catch (ParseException e) {
+            logger.warn("Failed to parse timestamp '{}': {}", value, e.getMessage());
+            return java.sql.Timestamp.valueOf(value);
+        }
+    }
+
+    private java.sql.Date parseDate(String value) {
+        if (value == null || value.isEmpty()) return null;
+        try {
+            synchronized (DATE_PARSE_FMT) {
+                java.util.Date date = DATE_PARSE_FMT.parse(value);
+                return new java.sql.Date(date.getTime());
+            }
+        } catch (ParseException e) {
+            logger.warn("Failed to parse date '{}': {}", value, e.getMessage());
+            return java.sql.Date.valueOf(value);
+        }
+    }
+
+    private java.sql.Time parseTime(String value) {
+        if (value == null || value.isEmpty()) return null;
+        try {
+            synchronized (TIME_PARSE_FMT) {
+                java.util.Date date = TIME_PARSE_FMT.parse(value);
+                return new java.sql.Time(date.getTime());
+            }
+        } catch (ParseException e) {
+            logger.warn("Failed to parse time '{}': {}", value, e.getMessage());
+            return java.sql.Time.valueOf(value);
+        }
+    }
+
+    private boolean isRowPart(String part) {
+        if (part.startsWith("row_count=")) return false;
+        int eqIdx = part.indexOf('=');
+        if (eqIdx < 0) return false;
+        String prefix = part.substring(0, eqIdx);
+        if (prefix.startsWith("row")) {
+            String numPart = prefix.substring(3);
+            return !numPart.isEmpty() && numPart.chars().allMatch(Character::isDigit);
+        }
+        return false;
     }
 
     private String unescapeSpecialChars(String s) {
@@ -840,7 +970,12 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                 byte[] eventBytes = line.getBytes("UTF-8");
                 THLEvent event = extract(eventBytes);
                 if (event != null) {
-                    oos.writeObject(event);
+                    if (pipeline != null) {
+                        event = pipeline.process(event);
+                    }
+                    if (event != null) {
+                        oos.writeObject(event);
+                    }
                 }
             }
         }

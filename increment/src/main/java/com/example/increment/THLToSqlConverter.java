@@ -11,9 +11,13 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.Statement;
 import java.sql.SQLException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.TimeZone;
 
 import com.example.thl.THLEvent;
 import com.example.thl.THLFileReader;
@@ -31,6 +35,9 @@ public class THLToSqlConverter {
     private Connection targetConnection;
 
     private SqlClassifier sqlClassifier;
+    private SqlConflictKeyParser conflictKeyParser;
+    private Properties props;
+    private boolean concurrentMode;
 
     private LinkedHashMap<Long, String> executedRecords;
     private String executedRecordFile;
@@ -58,8 +65,11 @@ public class THLToSqlConverter {
         this.targetUrl = props.getProperty("target.mysql.url");
         this.targetUser = props.getProperty("target.mysql.user");
         this.targetPassword = props.getProperty("target.mysql.password");
+        this.props = props;
+        this.concurrentMode = "batch".equalsIgnoreCase(props.getProperty("concurrent.mode", "single"));
 
         this.sqlClassifier = new SqlClassifier();
+        this.conflictKeyParser = new SqlConflictKeyParser();
 
         this.executedRecords = new LinkedHashMap<>();
         this.executedRecordFile = inputDir + "/.executed_records";
@@ -182,8 +192,14 @@ public class THLToSqlConverter {
     }
 
     private void connect() throws SQLException {
-        targetConnection = DriverManager.getConnection(targetUrl, targetUser, targetPassword);
-        logger.info("Connected to target MySQL: {}", targetUrl);
+        String url = targetUrl;
+        if (!url.contains("serverTimezone") && !url.contains("?")) {
+            url = url + "?serverTimezone=UTC&useSSL=false";
+        } else if (!url.contains("serverTimezone")) {
+            url = url + "&serverTimezone=UTC";
+        }
+        targetConnection = DriverManager.getConnection(url, targetUser, targetPassword);
+        logger.info("Connected to target MySQL: {}", url);
     }
 
     public void disconnect() {
@@ -200,43 +216,127 @@ public class THLToSqlConverter {
     private void processTHLFile(File thlFile) throws Exception {
         THLFileReader reader = new THLFileReader(thlFile.getAbsolutePath());
         try {
-            THLEvent event;
-            while ((event = reader.readEvent()) != null) {
-                totalEvents++;
-
-                long seqno = event.getSeqno();
-
-                if (executedRecords.containsKey(seqno)) {
-                    logger.debug("Skipping already executed seqno: {}", seqno);
-                    continue;
-                }
-
-                java.util.List<String> sqlStatements = convertToSql(event);
-
-                if (sqlStatements == null || sqlStatements.isEmpty()) {
-                    continue;
-                }
-
-                for (String sql : sqlStatements) {
-                    String executableSql = extractExecutableSql(sql);
-                    if (executableSql.isEmpty()) continue;
-
-                    try {
-                        executeSql(executableSql);
-                        logger.info("✓ [seqno={}] SQL executed successfully: {}", seqno, executableSql);
-                    } catch (SQLException e) {
-                        failedEvents++;
-                        logger.error("✗ [seqno={}] SQL execution failed: {}\nError: {}", seqno, executableSql, e.getMessage());
-                        throw new SqlExecutionException(seqno, executableSql, e);
-                    }
-                }
-
-                successfulEvents++;
-                String firstSql = extractExecutableSql(sqlStatements.get(0));
-                saveExecutedRecord(seqno, firstSql);
+            if (concurrentMode) {
+                processTHLFileConcurrent(reader);
+            } else {
+                processTHLFileSequential(reader);
             }
         } finally {
             reader.close();
+        }
+    }
+
+    private void processTHLFileSequential(THLFileReader reader) throws Exception {
+        THLEvent event;
+        while ((event = reader.readEvent()) != null) {
+            totalEvents++;
+
+            long seqno = event.getSeqno();
+
+            if (executedRecords.containsKey(seqno)) {
+                logger.debug("Skipping already executed seqno: {}", seqno);
+                continue;
+            }
+
+            java.util.List<String> sqlStatements = convertToSql(event);
+
+            if (sqlStatements == null || sqlStatements.isEmpty()) {
+                continue;
+            }
+
+            int subSeqno = 0;
+            for (String sql : sqlStatements) {
+                String executableSql = extractExecutableSql(sql);
+                if (executableSql.isEmpty()) continue;
+
+                long statementSeqno = sqlStatements.size() == 1 ? seqno : (seqno * 1000 + subSeqno);
+                subSeqno++;
+
+                if (executedRecords.containsKey(statementSeqno)) {
+                    logger.debug("Skipping already executed statement seqno: {}", statementSeqno);
+                    continue;
+                }
+
+                try {
+                    executeSql(executableSql);
+                    logger.info("✓ [seqno={}] SQL executed successfully: {}", statementSeqno, executableSql);
+                } catch (SQLException e) {
+                    failedEvents++;
+                    logger.error("✗ [seqno={}] SQL execution failed: {}\nError: {}", statementSeqno, executableSql, e.getMessage());
+                    throw new SqlExecutionException(statementSeqno, executableSql, e);
+                }
+
+                saveExecutedRecord(statementSeqno, executableSql);
+            }
+
+            successfulEvents++;
+        }
+    }
+
+    private void processTHLFileConcurrent(THLFileReader reader) throws Exception {
+        List<SqlStatement> allStatements = new ArrayList<>();
+        Map<Long, String> seqnoToSql = new LinkedHashMap<>();
+        conflictKeyParser.reset();
+
+        THLEvent event;
+        while ((event = reader.readEvent()) != null) {
+            totalEvents++;
+
+            long seqno = event.getSeqno();
+
+            java.util.List<String> sqlStatements = convertToSql(event);
+            if (sqlStatements == null || sqlStatements.isEmpty()) continue;
+
+            int subSeqno = 0;
+            for (String sql : sqlStatements) {
+                String executableSql = extractExecutableSql(sql);
+                if (executableSql.isEmpty()) continue;
+
+                long statementSeqno = sqlStatements.size() == 1 ? seqno : (seqno * 1000 + subSeqno);
+                subSeqno++;
+
+                if (executedRecords.containsKey(statementSeqno)) {
+                    logger.debug("Skipping already executed statement seqno: {}", statementSeqno);
+                    continue;
+                }
+
+                SqlStatement stmt = conflictKeyParser.parse(executableSql, statementSeqno);
+                if (stmt != null) {
+                    allStatements.add(stmt);
+                    seqnoToSql.put(statementSeqno, executableSql);
+                }
+            }
+        }
+
+        if (allStatements.isEmpty()) {
+            logger.info("No SQL statements to execute");
+            return;
+        }
+
+        long dmlCount = allStatements.stream().filter(SqlStatement::isDml).count();
+        long barrierCount = allStatements.stream().filter(SqlStatement::isBarrier).count();
+        logger.info("Parsed {} SQL statements: {} DML (concurrent), {} barriers (DDL/DCL/COMMIT sequential)",
+                allStatements.size(), dmlCount, barrierCount);
+
+        DependencyGraph graph = new DependencyGraph(allStatements);
+        ConcurrentSqlExecutor executor = new ConcurrentSqlExecutor(props);
+
+        try {
+            ConcurrentSqlExecutor.ExecutionResult result = executor.execute(graph);
+
+            logger.info("Concurrent execution result: {}", result);
+
+            if (result.getFailureCount() == 0) {
+                for (Long seqno : seqnoToSql.keySet()) {
+                    saveExecutedRecordDirectly(seqno, seqnoToSql.get(seqno));
+                }
+                successfulEvents += result.getSuccessCount();
+            } else {
+                failedEvents += result.getFailureCount();
+                logger.error("Execution had {} failures, not saving progress", result.getFailureCount());
+            }
+        } finally {
+            executor.shutdown();
         }
     }
 
@@ -251,7 +351,7 @@ public class THLToSqlConverter {
         return cleanSql.toString().trim();
     }
 
-    private java.util.List<String> convertToSql(THLEvent event) {
+    public java.util.List<String> convertToSql(THLEvent event) {
         java.util.List<String> sqlStatements = new java.util.ArrayList<>();
 
         Map<String, Object> metadata = event.getMetadata();
@@ -463,6 +563,16 @@ public class THLToSqlConverter {
         String[] columnNames = getColumnNames(metadata);
         String[] columnTypes = getColumnTypes(metadata);
 
+        String pkColumnsStr = (String) metadata.get("primary_key_columns");
+        java.util.Set<String> pkColumns = new java.util.HashSet<>();
+        if (pkColumnsStr != null && !pkColumnsStr.isEmpty()) {
+            for (String pk : pkColumnsStr.split(",")) {
+                pkColumns.add(pk.trim());
+            }
+        }
+
+        boolean hasPrimaryKey = !pkColumns.isEmpty();
+
         for (java.util.Map.Entry<Object[], Object[]> entry : rows) {
             Object[] oldRow = entry.getKey();
             Object[] newRow = entry.getValue();
@@ -478,15 +588,32 @@ public class THLToSqlConverter {
             }
 
             sql.append(" WHERE ");
-            for (int i = 0; i < oldRow.length; i++) {
-                if (i > 0) sql.append(" AND ");
-                String colName = (columnNames != null && i < columnNames.length) ? columnNames[i] : "column" + i;
-                String colType = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : null;
-                if (oldRow[i] == null) {
-                    sql.append("`").append(colName).append("` IS NULL");
-                } else {
-                    sql.append("`").append(colName).append("`=").append(formatValueByType(oldRow[i], colType));
+            if (hasPrimaryKey) {
+                boolean first = true;
+                for (int i = 0; i < oldRow.length; i++) {
+                    String colName = (columnNames != null && i < columnNames.length) ? columnNames[i] : "column" + i;
+                    if (!pkColumns.contains(colName)) continue;
+                    if (!first) sql.append(" AND ");
+                    first = false;
+                    String colType = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : null;
+                    if (oldRow[i] == null) {
+                        sql.append("`").append(colName).append("` IS NULL");
+                    } else {
+                        sql.append("`").append(colName).append("`=").append(formatValueByType(oldRow[i], colType));
+                    }
                 }
+            } else {
+                for (int i = 0; i < oldRow.length; i++) {
+                    if (i > 0) sql.append(" AND ");
+                    String colName = (columnNames != null && i < columnNames.length) ? columnNames[i] : "column" + i;
+                    String colType = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : null;
+                    if (oldRow[i] == null) {
+                        sql.append("`").append(colName).append("` IS NULL");
+                    } else {
+                        sql.append("`").append(colName).append("`=").append(formatValueByType(oldRow[i], colType));
+                    }
+                }
+                sql.append(" LIMIT 1");
             }
             sql.append(";");
             statements.add(sql.toString());
@@ -517,19 +644,46 @@ public class THLToSqlConverter {
         String[] columnNames = getColumnNames(metadata);
         String[] columnTypes = getColumnTypes(metadata);
 
+        String pkColumnsStr = (String) metadata.get("primary_key_columns");
+        java.util.Set<String> pkColumns = new java.util.HashSet<>();
+        if (pkColumnsStr != null && !pkColumnsStr.isEmpty()) {
+            for (String pk : pkColumnsStr.split(",")) {
+                pkColumns.add(pk.trim());
+            }
+        }
+
+        boolean hasPrimaryKey = !pkColumns.isEmpty();
+
         for (Object[] row : rows) {
             StringBuilder sql = new StringBuilder();
             sql.append("DELETE FROM `").append(database).append("`.`").append(table).append("` WHERE ");
 
-            for (int i = 0; i < row.length; i++) {
-                if (i > 0) sql.append(" AND ");
-                String colName = (columnNames != null && i < columnNames.length) ? columnNames[i] : "column" + i;
-                String colType = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : null;
-                if (row[i] == null) {
-                    sql.append("`").append(colName).append("` IS NULL");
-                } else {
-                    sql.append("`").append(colName).append("`=").append(formatValueByType(row[i], colType));
+            if (hasPrimaryKey) {
+                boolean first = true;
+                for (int i = 0; i < row.length; i++) {
+                    String colName = (columnNames != null && i < columnNames.length) ? columnNames[i] : "column" + i;
+                    if (!pkColumns.contains(colName)) continue;
+                    if (!first) sql.append(" AND ");
+                    first = false;
+                    String colType = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : null;
+                    if (row[i] == null) {
+                        sql.append("`").append(colName).append("` IS NULL");
+                    } else {
+                        sql.append("`").append(colName).append("`=").append(formatValueByType(row[i], colType));
+                    }
                 }
+            } else {
+                for (int i = 0; i < row.length; i++) {
+                    if (i > 0) sql.append(" AND ");
+                    String colName = (columnNames != null && i < columnNames.length) ? columnNames[i] : "column" + i;
+                    String colType = (columnTypes != null && i < columnTypes.length) ? columnTypes[i] : null;
+                    if (row[i] == null) {
+                        sql.append("`").append(colName).append("` IS NULL");
+                    } else {
+                        sql.append("`").append(colName).append("`=").append(formatValueByType(row[i], colType));
+                    }
+                }
+                sql.append(" LIMIT 1");
             }
             sql.append(";");
             statements.add(sql.toString());
@@ -615,6 +769,16 @@ public class THLToSqlConverter {
         }
     }
 
+    private static final TimeZone UTC_TZ = TimeZone.getTimeZone("UTC");
+    private static final SimpleDateFormat TS_FMT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+    private static final SimpleDateFormat DT_FMT = new SimpleDateFormat("yyyy-MM-dd");
+    private static final SimpleDateFormat TM_FMT = new SimpleDateFormat("HH:mm:ss");
+    static {
+        TS_FMT.setTimeZone(UTC_TZ);
+        DT_FMT.setTimeZone(UTC_TZ);
+        TM_FMT.setTimeZone(UTC_TZ);
+    }
+
     private String formatValue(Object value) {
         if (value == null) {
             return "NULL";
@@ -629,13 +793,21 @@ public class THLToSqlConverter {
         } else if (value instanceof Number) {
             return value.toString();
         } else if (value instanceof java.sql.Timestamp) {
-            return "'" + ((java.sql.Timestamp) value).toString() + "'";
+            synchronized (TS_FMT) {
+                return "'" + TS_FMT.format((java.sql.Timestamp) value) + "'";
+            }
         } else if (value instanceof java.sql.Date) {
-            return "'" + value.toString() + "'";
+            synchronized (DT_FMT) {
+                return "'" + DT_FMT.format((java.sql.Date) value) + "'";
+            }
         } else if (value instanceof java.sql.Time) {
-            return "'" + value.toString() + "'";
+            synchronized (TM_FMT) {
+                return "'" + TM_FMT.format((java.sql.Time) value) + "'";
+            }
         } else if (value instanceof java.util.Date) {
-            return "'" + new java.sql.Timestamp(((java.util.Date) value).getTime()).toString() + "'";
+            synchronized (TS_FMT) {
+                return "'" + TS_FMT.format((java.util.Date) value) + "'";
+            }
         } else if (value instanceof Boolean) {
             return ((Boolean) value) ? "1" : "0";
         } else if (value instanceof byte[]) {
@@ -670,6 +842,10 @@ public class THLToSqlConverter {
         executedRecords.clear();
         rewriteExecutedRecordsFile();
         logger.info("Cleared all executed records");
+    }
+
+    public void saveExecutedRecordDirectly(long seqno, String sql) {
+        saveExecutedRecord(seqno, sql);
     }
 
     public void setSeqnoPosition(long seqno) {
@@ -731,23 +907,32 @@ public class THLToSqlConverter {
                     continue;
                 }
 
+                int subSeqno = 0;
                 for (String sql : sqlStatements) {
                     String executableSql = extractExecutableSql(sql);
                     if (executableSql.isEmpty()) continue;
 
+                    long statementSeqno = sqlStatements.size() == 1 ? seqno : (seqno * 1000 + subSeqno);
+                    subSeqno++;
+
+                    if (executedRecords.containsKey(statementSeqno)) {
+                        logger.debug("Skipping already executed statement seqno: {}", statementSeqno);
+                        continue;
+                    }
+
                     try {
                         executeSql(executableSql);
-                        logger.info("✓ [seqno={}] SQL executed successfully: {}", seqno, executableSql);
+                        logger.info("✓ [seqno={}] SQL executed successfully: {}", statementSeqno, executableSql);
                     } catch (SQLException e) {
                         failedEvents++;
-                        logger.error("✗ [seqno={}] SQL execution failed: {}\nError: {}", seqno, executableSql, e.getMessage());
-                        throw new SqlExecutionException(seqno, executableSql, e);
+                        logger.error("✗ [seqno={}] SQL execution failed: {}\nError: {}", statementSeqno, executableSql, e.getMessage());
+                        throw new SqlExecutionException(statementSeqno, executableSql, e);
                     }
+
+                    saveExecutedRecord(statementSeqno, executableSql);
                 }
 
                 successfulEvents++;
-                String firstSql = extractExecutableSql(sqlStatements.get(0));
-                saveExecutedRecord(seqno, firstSql);
             }
         } finally {
             reader.close();
