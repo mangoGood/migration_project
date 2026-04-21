@@ -1,6 +1,6 @@
 # Output directories
-output/
-*/output/
+# output/
+# */output/
 
 # Maven
 target/
