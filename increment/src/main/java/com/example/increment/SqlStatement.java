@@ -7,6 +7,7 @@ public class SqlStatement {
     private final String sql;
     private final OperationType operationType;
     private final String database;
+    private final String ddlDatabase;
     private final String tableName;
     private final String primaryKeyValue;
     private final String conflictKey;
@@ -28,6 +29,7 @@ public class SqlStatement {
         this.sql = builder.sql;
         this.operationType = builder.operationType;
         this.database = builder.database;
+        this.ddlDatabase = builder.ddlDatabase;
         this.tableName = builder.tableName;
         this.primaryKeyValue = builder.primaryKeyValue;
         this.conflictKey = builder.conflictKey != null ? builder.conflictKey : buildConflictKey();
@@ -61,6 +63,7 @@ public class SqlStatement {
     public String getSql() { return sql; }
     public OperationType getOperationType() { return operationType; }
     public String getDatabase() { return database; }
+    public String getDdlDatabase() { return ddlDatabase; }
     public String getTableName() { return tableName; }
     public String getPrimaryKeyValue() { return primaryKeyValue; }
     public String getConflictKey() { return conflictKey; }
@@ -92,6 +95,7 @@ public class SqlStatement {
         private String sql;
         private OperationType operationType = OperationType.OTHER;
         private String database;
+        private String ddlDatabase;
         private String tableName;
         private String primaryKeyValue;
         private String conflictKey;
@@ -102,6 +106,7 @@ public class SqlStatement {
         public Builder sql(String sql) { this.sql = sql; return this; }
         public Builder operationType(OperationType operationType) { this.operationType = operationType; return this; }
         public Builder database(String database) { this.database = database; return this; }
+        public Builder ddlDatabase(String ddlDatabase) { this.ddlDatabase = ddlDatabase; return this; }
         public Builder tableName(String tableName) { this.tableName = tableName; return this; }
         public Builder primaryKeyValue(String primaryKeyValue) { this.primaryKeyValue = primaryKeyValue; return this; }
         public Builder conflictKey(String conflictKey) { this.conflictKey = conflictKey; return this; }

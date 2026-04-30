@@ -697,8 +697,10 @@ public class THLToSqlConverter {
 
         String sql = (String) metadata.get("sql");
         String database = (String) metadata.get("database_name");
+        String ddlDatabase = (String) metadata.get("ddl_database");
+        String defaultDatabase = props != null ? props.getProperty("default.database", "") : "";
 
-        logger.debug("Generating QUERY SQL - database: {}, sql: {}", database, sql);
+        logger.debug("Generating QUERY SQL - database: {}, ddl_database: {}, sql: {}", database, ddlDatabase, sql);
 
         if (sql == null || sql.isEmpty()) {
             return statements;
@@ -728,11 +730,25 @@ public class THLToSqlConverter {
             return statements;
         }
 
-        if (classification.isDdl() && classification.isNeedsDatabaseSelection()
-                && database != null && !database.isEmpty()) {
-            statements.add("USE `" + database + "`;");
-            logger.info("Generated USE database statement for database: {} (DDL type: {})",
-                database, classification.getDdlSubType());
+        if (classification.isDdl()) {
+            String effectiveDb = resolveDdlDatabase(ddlDatabase, database, defaultDatabase, sql);
+            if (effectiveDb != null && !effectiveDb.isEmpty() && classification.isNeedsDatabaseSelection()) {
+                String cleanSql = sql.trim();
+                if (!cleanSql.endsWith(";")) {
+                    cleanSql = cleanSql + ";";
+                }
+                String atomicSql = "USE `" + effectiveDb + "`; " + cleanSql;
+                statements.add(atomicSql);
+                logger.info("Generated atomic USE+DDL for database: {} (DDL type: {})",
+                        effectiveDb, classification.getDdlSubType());
+            } else {
+                String cleanSql = sql.trim();
+                if (!cleanSql.endsWith(";")) {
+                    cleanSql = cleanSql + ";";
+                }
+                statements.add(cleanSql);
+            }
+            return statements;
         }
 
         if (classification.isDml() && database != null && !database.isEmpty()) {
@@ -752,19 +768,57 @@ public class THLToSqlConverter {
         return statements;
     }
 
-    private void executeSql(String sql) throws SQLException {
-        try (Statement stmt = targetConnection.createStatement()) {
-            if (sql.isEmpty()) return;
+    private String resolveDdlDatabase(String ddlDatabase, String binlogDatabase, String defaultDatabase, String sql) {
+        if (ddlDatabase != null && !ddlDatabase.isEmpty()) {
+            logger.debug("Using ddl_database from THL metadata: {}", ddlDatabase);
+            return ddlDatabase;
+        }
+        if (binlogDatabase != null && !binlogDatabase.isEmpty()) {
+            logger.debug("Using binlog database_name as fallback: {}", binlogDatabase);
+            return binlogDatabase;
+        }
+        if (defaultDatabase != null && !defaultDatabase.isEmpty()) {
+            logger.debug("Using default database as fallback: {}", defaultDatabase);
+            return defaultDatabase;
+        }
+        logger.warn("Cannot determine database for DDL, sql: {}", sql != null ? sql.substring(0, Math.min(sql.length(), 100)) : "null");
+        return null;
+    }
 
-            String[] individualStatements = sql.split(";");
-            for (String individualSql : individualStatements) {
-                individualSql = individualSql.trim();
-                if (!individualSql.isEmpty()) {
-                    logger.debug("Executing SQL: {}", individualSql);
-                    stmt.execute(individualSql);
+    private void executeSql(String sql) throws SQLException {
+        if (sql == null || sql.isEmpty()) return;
+
+        boolean isAtomicDdl = sql.trim().toUpperCase().startsWith("USE ");
+
+        if (isAtomicDdl) {
+            executeAtomicDdl(sql);
+        } else {
+            try (Statement stmt = targetConnection.createStatement()) {
+                String[] individualStatements = sql.split(";");
+                for (String individualSql : individualStatements) {
+                    individualSql = individualSql.trim();
+                    if (!individualSql.isEmpty()) {
+                        logger.debug("Executing SQL: {}", individualSql);
+                        stmt.execute(individualSql);
+                    }
                 }
             }
+        }
+    }
+
+    private void executeAtomicDdl(String sql) throws SQLException {
+        try (Statement stmt = targetConnection.createStatement()) {
+            String[] parts = sql.split(";");
+            for (String part : parts) {
+                String trimmed = part.trim();
+                if (!trimmed.isEmpty()) {
+                    logger.debug("Executing atomic DDL part: {}", trimmed);
+                    stmt.execute(trimmed);
+                }
+            }
+            logger.debug("Atomic DDL execution completed successfully");
         } catch (SQLException e) {
+            logger.error("Atomic DDL execution failed, USE and DDL may be in inconsistent state: {}", e.getMessage());
             throw e;
         }
     }

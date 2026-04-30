@@ -238,19 +238,24 @@ public class ConcurrentSqlExecutor {
                 return new StatementResult(true, 0, null);
             }
 
-            String[] sqlParts = stmt.getSql().split(";");
-            int totalAffected = 0;
-            for (String sqlPart : sqlParts) {
-                String trimmed = sqlPart.trim();
-                if (!trimmed.isEmpty()) {
-                    logger.debug("[seqno={}] Executing SQL: {}", stmt.getSeqno(),
-                            trimmed.length() > 200 ? trimmed.substring(0, 200) + "..." : trimmed);
-                    statement.execute(trimmed);
+            boolean isAtomicDdl = stmt.isBarrier() && stmt.getSql().trim().toUpperCase().startsWith("USE ");
+
+            if (isAtomicDdl) {
+                executeAtomicDdlInStatement(stmt, statement);
+            } else {
+                String[] sqlParts = stmt.getSql().split(";");
+                for (String sqlPart : sqlParts) {
+                    String trimmed = sqlPart.trim();
+                    if (!trimmed.isEmpty()) {
+                        logger.debug("[seqno={}] Executing SQL: {}", stmt.getSeqno(),
+                                trimmed.length() > 200 ? trimmed.substring(0, 200) + "..." : trimmed);
+                        statement.execute(trimmed);
+                    }
                 }
             }
 
             logger.debug("Successfully executed statement id={}, seqno={}", stmt.getId(), stmt.getSeqno());
-            return new StatementResult(true, totalAffected, null);
+            return new StatementResult(true, 0, null);
 
         } catch (SQLException e) {
             logger.error("Failed to execute statement id={}, seqno={}: {}", stmt.getId(), stmt.getSeqno(), e.getMessage());
@@ -260,6 +265,19 @@ public class ConcurrentSqlExecutor {
             closeQuietly(statement);
             closeQuietly(connection);
         }
+    }
+
+    private void executeAtomicDdlInStatement(SqlStatement stmt, Statement statement) throws SQLException {
+        String sql = stmt.getSql();
+        String[] parts = sql.split(";");
+        for (String part : parts) {
+            String trimmed = part.trim();
+            if (!trimmed.isEmpty()) {
+                logger.debug("[seqno={}] Executing atomic DDL part: {}", stmt.getSeqno(), trimmed);
+                statement.execute(trimmed);
+            }
+        }
+        logger.debug("[seqno={}] Atomic DDL execution completed: USE + DDL", stmt.getSeqno());
     }
 
     private void closeQuietly(AutoCloseable closeable) {

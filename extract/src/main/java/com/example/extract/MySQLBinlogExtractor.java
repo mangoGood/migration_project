@@ -525,6 +525,16 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
             }
         }
         
+        if ("QUERY".equals(eventType) && sql != null && !sql.isEmpty()) {
+            String ddlDatabase = DdlDatabaseAnltrExtractor.extractDatabase(
+                    sql, database, props.getProperty("default.database", ""));
+            if (ddlDatabase != null && !ddlDatabase.isEmpty()) {
+                thlEvent.addMetadata("ddl_database", ddlDatabase);
+                logger.debug("Set ddl_database for QUERY event: seqno={}, ddl_database={}, sql={}",
+                        thlEvent.getSeqno(), ddlDatabase, sql.substring(0, Math.min(sql.length(), 100)));
+            }
+        }
+
         thlEvent.setData(input);
         
         lastExtractedPosition = binlogFile + ":" + position;
@@ -577,7 +587,21 @@ public class MySQLBinlogExtractor extends AbstractExtractor<byte[], THLEvent> {
                 thlEvent.addMetadata("xid", Long.parseLong(part.substring("xid=".length())));
             }
         }
-        
+
+        if ("QUERY".equals(eventType)) {
+            String legacySql = (String) thlEvent.getMetadata("sql");
+            String legacyDatabase = (String) thlEvent.getMetadata("database_name");
+            if (legacySql != null && !legacySql.isEmpty()) {
+                String ddlDatabase = DdlDatabaseAnltrExtractor.extractDatabase(
+                        legacySql, legacyDatabase, props.getProperty("default.database", ""));
+                if (ddlDatabase != null && !ddlDatabase.isEmpty()) {
+                    thlEvent.addMetadata("ddl_database", ddlDatabase);
+                    logger.debug("Set ddl_database for legacy QUERY event: seqno={}, ddl_database={}",
+                            thlEvent.getSeqno(), ddlDatabase);
+                }
+            }
+        }
+
         thlEvent.setData(input);
         return thlEvent;
     }

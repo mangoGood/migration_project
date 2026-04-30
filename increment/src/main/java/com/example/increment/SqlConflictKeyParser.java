@@ -17,6 +17,8 @@ public class SqlConflictKeyParser {
             Pattern.compile("UPDATE\\s+`?(\\w+)`?\\.`?(\\w+)`?\\s+SET", Pattern.CASE_INSENSITIVE);
     private static final Pattern DELETE_TABLE_PATTERN =
             Pattern.compile("DELETE\\s+FROM\\s+`?(\\w+)`?\\.`?(\\w+)`?", Pattern.CASE_INSENSITIVE);
+    private static final Pattern USE_DB_PATTERN =
+            Pattern.compile("USE\\s+`?(\\w+)`?\\s*;", Pattern.CASE_INSENSITIVE);
 
     private static final Pattern WHERE_PK_PATTERN =
             Pattern.compile("WHERE\\s+`?(\\w+)`?\\s*=\\s*([^;\\s]+)", Pattern.CASE_INSENSITIVE);
@@ -41,7 +43,18 @@ public class SqlConflictKeyParser {
         sql = sql.trim();
         if (sql.isEmpty()) return null;
 
-        SqlStatement.OperationType type = detectOperationType(sql);
+        String ddlDatabase = null;
+        String strippedSql = sql;
+        Matcher useMatcher = USE_DB_PATTERN.matcher(sql);
+        if (useMatcher.find()) {
+            ddlDatabase = useMatcher.group(1);
+            int semicolonIdx = sql.indexOf(';', useMatcher.start());
+            if (semicolonIdx >= 0 && semicolonIdx < sql.length() - 1) {
+                strippedSql = sql.substring(semicolonIdx + 1).trim();
+            }
+        }
+
+        SqlStatement.OperationType type = detectOperationType(strippedSql.isEmpty() ? sql : strippedSql);
         String database = null;
         String tableName = null;
         String primaryKeyValue = null;
@@ -52,6 +65,7 @@ public class SqlConflictKeyParser {
                     .seqno(seqno)
                     .sql(sql)
                     .operationType(type)
+                    .ddlDatabase(ddlDatabase)
                     .isTransactionBoundary(true)
                     .build();
         }
@@ -59,12 +73,12 @@ public class SqlConflictKeyParser {
         if (type == SqlStatement.OperationType.INSERT
                 || type == SqlStatement.OperationType.UPDATE
                 || type == SqlStatement.OperationType.DELETE) {
-            String[] tableInfo = extractTableInfo(sql, type);
+            String[] tableInfo = extractTableInfo(strippedSql.isEmpty() ? sql : strippedSql, type);
             if (tableInfo != null) {
                 database = tableInfo[0];
                 tableName = tableInfo[1];
             }
-            primaryKeyValue = extractPrimaryKey(sql, type, tableName);
+            primaryKeyValue = extractPrimaryKey(strippedSql.isEmpty() ? sql : strippedSql, type, tableName);
         }
 
         if (type == SqlStatement.OperationType.DDL) {
@@ -74,6 +88,7 @@ public class SqlConflictKeyParser {
                     .sql(sql)
                     .operationType(type)
                     .database(database)
+                    .ddlDatabase(ddlDatabase)
                     .tableName(tableName)
                     .isTransactionBoundary(true)
                     .build();
@@ -85,6 +100,7 @@ public class SqlConflictKeyParser {
                     .seqno(seqno)
                     .sql(sql)
                     .operationType(type)
+                    .ddlDatabase(ddlDatabase)
                     .isTransactionBoundary(true)
                     .build();
         }
@@ -102,6 +118,15 @@ public class SqlConflictKeyParser {
 
     private SqlStatement.OperationType detectOperationType(String sql) {
         String upperSql = sql.toUpperCase().trim();
+
+        if (upperSql.startsWith("USE ")) {
+            String afterUse = stripUsePrefix(upperSql);
+            if (afterUse != null) {
+                return detectOperationType(afterUse);
+            }
+            return SqlStatement.OperationType.OTHER;
+        }
+
         if (upperSql.startsWith("INSERT")) return SqlStatement.OperationType.INSERT;
         if (upperSql.startsWith("UPDATE")) return SqlStatement.OperationType.UPDATE;
         if (upperSql.startsWith("DELETE")) return SqlStatement.OperationType.DELETE;
@@ -122,6 +147,14 @@ public class SqlConflictKeyParser {
                 || upperSql.startsWith("UNLOCK TABLES") || upperSql.startsWith("FLUSH"))
             return SqlStatement.OperationType.DCL;
         return SqlStatement.OperationType.OTHER;
+    }
+
+    private String stripUsePrefix(String upperSql) {
+        int semicolonIdx = upperSql.indexOf(';');
+        if (semicolonIdx >= 0 && semicolonIdx < upperSql.length() - 1) {
+            return upperSql.substring(semicolonIdx + 1).trim();
+        }
+        return null;
     }
 
     private String[] extractTableInfo(String sql, SqlStatement.OperationType type) {
